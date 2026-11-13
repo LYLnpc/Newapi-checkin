@@ -269,6 +269,28 @@ async function handler(request, env) {
 
   if (!getDb(env)) return missingDbError();
   if (!(await requireSession(request, env))) return json({ error: '登录已过期' }, 401, env);
+  if (method === 'POST' && path === '/api/dashboard/trigger') {
+    const dispatchToken = env.GITHUB_DISPATCH_TOKEN;
+    if (!dispatchToken) return json({ error: 'Worker 尚未配置 GITHUB_DISPATCH_TOKEN' }, 503, env);
+    const repo = env.GITHUB_DISPATCH_REPO || 'LYLnpc/Newapi-checkin';
+    const workflow = env.GITHUB_DISPATCH_WORKFLOW || 'checkin.yml';
+    const branch = env.GITHUB_DISPATCH_BRANCH || 'main';
+    const response = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/${workflow}/dispatches`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${dispatchToken}`,
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        'user-agent': 'newapi-checkin-worker',
+        'x-github-api-version': '2022-11-28',
+      },
+      body: JSON.stringify({ ref: branch }),
+    });
+    if (response.status !== 204) {
+      return json({ error: `GitHub 触发失败 (HTTP ${response.status})，请检查 GITHUB_DISPATCH_TOKEN 和工作流是否已启用` }, 502, env);
+    }
+    return json({ ok: true, message: '签到任务已提交，GitHub Actions 稍后执行' }, 202, env);
+  }
   if (method === 'GET' && path === '/api/dashboard/summary') {
     const latest = await getDb(env).prepare('SELECT * FROM runs ORDER BY id DESC LIMIT 1').first();
     const accounts = await getDb(env).prepare('SELECT * FROM accounts ORDER BY id').all();
