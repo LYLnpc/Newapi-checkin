@@ -493,7 +493,7 @@
                             <td><span class="status ${status.className}">${status.label}</span></td>
                             <td><span class="fail-count">${account.failure_count || 0}</span></td>
                             <td><span class="run-time">${formatTime(account.last_checkin_at)}</span></td>
-                            <td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="button secondary small account-edit" data-id="${account.id}" data-name="${escapeHtml(account.name)}" data-url="${escapeHtml(account.url)}">更新凭据</button><button class="button secondary small account-toggle" data-id="${account.id}" data-enabled="${account.enabled}">${account.enabled ? '停用' : '启用'}</button></div></td>
+                            <td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="button secondary small account-checkin" data-id="${account.id}" data-name="${escapeHtml(account.name)}" ${account.enabled ? '' : 'disabled title="请先填写 Cookie 并启用该账号"'}>签到</button><button class="button secondary small account-edit" data-id="${account.id}" data-name="${escapeHtml(account.name)}" data-url="${escapeHtml(account.url)}">更新凭据</button><button class="button secondary small account-toggle" data-id="${account.id}" data-enabled="${account.enabled}">${account.enabled ? '停用' : '启用'}</button></div></td>
                           </tr>`;
                         }).join('')}</tbody>
                       </table>` : '<div class="empty"><strong>还没有签到账号</strong>使用左侧表单添加第一个账号。</div>'}
@@ -608,6 +608,28 @@
               await renderDashboard();
             } catch (error) {
               showToast(error.message, true);
+            }
+          });
+        });
+
+        document.querySelectorAll('.account-checkin').forEach((button) => {
+          button.addEventListener('click', async () => {
+            button.disabled = true;
+            const label = button.textContent;
+            button.textContent = '提交中...';
+            try {
+              await api('/api/dashboard/trigger', {
+                method: 'POST',
+                body: JSON.stringify({ account_id: Number(button.dataset.id) }),
+              });
+              showToast(`已提交「${button.dataset.name}」的签到任务，稍后刷新查看结果`);
+            } catch (error) {
+              showToast(error.message, true);
+            } finally {
+              if (button.isConnected) {
+                button.disabled = false;
+                button.textContent = label;
+              }
             }
           });
         });
