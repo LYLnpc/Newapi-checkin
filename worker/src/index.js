@@ -134,6 +134,12 @@ async function ensureTables(env) {
       expires_at TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS single_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      consumed INTEGER NOT NULL DEFAULT 0
+    )`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_results_run_id ON run_results(run_id)`),
   ]);
@@ -186,7 +192,23 @@ async function handler(request, env) {
     if (!(await requireRunner(request, env))) return json({ error: 'Runner 未授权' }, 401, env);
     if (!getDb(env)) return missingDbError();
     if (method === 'GET' && path === '/api/runner/config') {
-      const rows = await getDb(env).prepare('SELECT id, name, url, secret FROM accounts WHERE enabled = 1 ORDER BY id').all();
+      const db = getDb(env);
+      // 面板「单账号签到」会留下一条一次性任务，只对 30 分钟内紧随其后的手动运行生效。
+      // 每天 UTC 0 点的定时窗口一律忽略，保证例行签到始终覆盖全部启用账号。
+      const utcHour = new Date().getUTCHours();
+      const pending = utcHour === 0 ? null : await db.prepare(
+        'SELECT id, account_id, created_at FROM single_runs WHERE consumed = 0 ORDER BY id DESC LIMIT 1'
+      ).first();
+      const fresh = pending && Number.isFinite(Date.parse(pending.created_at)) &&
+        (Date.now() - Date.parse(pending.created_at)) <= 30 * 60 * 1000;
+      let rows;
+      if (fresh) {
+        rows = await db.prepare('SELECT id, name, url, secret FROM accounts WHERE enabled = 1 AND id = ? ORDER BY id')
+          .bind(pending.account_id).all();
+        await db.prepare('UPDATE single_runs SET consumed = 1 WHERE id = ?').bind(pending.id).run();
+      } else {
+        rows = await db.prepare('SELECT id, name, url, secret FROM accounts WHERE enabled = 1 ORDER BY id').all();
+      }
       if (rows.results.length > 40) return json({ error: '启用账号数量超过 40，请先停用部分账号' }, 409, env);
       const accounts = [];
       for (const row of rows.results) {
@@ -272,6 +294,28 @@ async function handler(request, env) {
   if (method === 'POST' && path === '/api/dashboard/trigger') {
     const dispatchToken = env.GITHUB_DISPATCH_TOKEN;
     if (!dispatchToken) return json({ error: 'Worker 尚未配置 GITHUB_DISPATCH_TOKEN' }, 503, env);
+    const body = await text(request);
+    const hasAccountId = !!body && Object.prototype.hasOwnProperty.call(body, 'account_id');
+    const accountId = optionalInteger(body?.account_id);
+    let singleRunId = null;
+    if (hasAccountId) {
+      if (!accountId || accountId <= 0) return json({ error: '无效的账号 ID' }, 400, env);
+      const account = await getDb(env).prepare('SELECT id, enabled, secret FROM accounts WHERE id = ?').bind(accountId).first();
+      if (!account) return json({ error: '账号不存在' }, 404, env);
+      if (!account.enabled) return json({ error: '该账号尚未启用，请先填写 Cookie 并启用' }, 409, env);
+      let config;
+      try {
+        config = JSON.parse(await decrypt(account.secret, env));
+      } catch {
+        return json({ error: '账号凭据无法解密，请重新保存凭据' }, 500, env);
+      }
+      if (!config.session || String(config.session).startsWith('PENDING_COOKIE')) {
+        return json({ error: '该账号尚未填写 Session Cookie' }, 409, env);
+      }
+      const inserted = await getDb(env).prepare('INSERT INTO single_runs (account_id, created_at) VALUES (?, ?)')
+        .bind(accountId, now()).run();
+      singleRunId = inserted.meta.last_row_id;
+    }
     const repo = env.GITHUB_DISPATCH_REPO || 'LYLnpc/Newapi-checkin';
     const workflow = env.GITHUB_DISPATCH_WORKFLOW || 'checkin.yml';
     const branch = env.GITHUB_DISPATCH_BRANCH || 'main';
@@ -287,9 +331,10 @@ async function handler(request, env) {
       body: JSON.stringify({ ref: branch }),
     });
     if (response.status !== 204) {
+      if (singleRunId) await getDb(env).prepare('DELETE FROM single_runs WHERE id = ?').bind(singleRunId).run();
       return json({ error: `GitHub 触发失败 (HTTP ${response.status})，请检查 GITHUB_DISPATCH_TOKEN 和工作流是否已启用` }, 502, env);
     }
-    return json({ ok: true, message: '签到任务已提交，GitHub Actions 稍后执行' }, 202, env);
+    return json({ ok: true, message: singleRunId ? '已提交该账号的签到任务，GitHub Actions 稍后执行' : '签到任务已提交，GitHub Actions 稍后执行' }, 202, env);
   }
   if (method === 'GET' && path === '/api/dashboard/summary') {
     const latest = await getDb(env).prepare('SELECT * FROM runs ORDER BY id DESC LIMIT 1').first();
@@ -316,11 +361,15 @@ async function handler(request, env) {
     if (!body?.name || !origin || !body?.session || !body?.user_id) return json({ error: '请填写有效的名称、HTTPS URL、Session 和用户 ID' }, 400, env);
     const createdAt = now();
     const secret = await encrypt(JSON.stringify({ url: origin, session: body.session, user_id: body.user_id, cf_clearance: body.cf_clearance || undefined }), env);
-    const inserted = await getDb(env).prepare(`INSERT INTO accounts (name, url, secret, created_at, updated_at)
+    // 占位账号（enabled=false）不占用 40 个启用名额，也不会被 Runner 拉取。
+    const placeholder = body.enabled === false;
+    const inserted = await getDb(env).prepare(placeholder
+      ? `INSERT INTO accounts (name, url, secret, enabled, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)`
+      : `INSERT INTO accounts (name, url, secret, created_at, updated_at)
       SELECT ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM accounts WHERE enabled = 1) < 40`)
       .bind(body.name, origin, secret, createdAt, createdAt).run();
     if (!inserted.meta.changes) return json({ error: '启用账号数量已达到 40 个上限' }, 409, env);
-    return json({ ok: true }, 201, env);
+    return json({ ok: true, placeholder }, 201, env);
   }
   if (method === 'PATCH' && path.startsWith('/api/dashboard/accounts/')) {
     const id = path.split('/').pop();
