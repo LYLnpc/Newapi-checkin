@@ -271,17 +271,60 @@ def build_checkin_report(results: List[Dict[str, Any]], execution_time: str) -> 
     return '\n'.join(lines)
 
 
+def _send_generic_webhook(results: List[Dict[str, Any]], execution_time: str) -> bool:
+    """通用 Webhook 推送（可选）。失败只记录原因，绝不影响签到主流程。"""
+    url = (os.environ.get('GENERIC_WEBHOOK_URL') or '').strip()
+    if not url:
+        return False
+    if not url.lower().startswith('https://'):
+        print('[通用通知] 地址必须是 HTTPS，跳过通知')
+        return False
+    if requests is None:
+        print('[通用通知] 未安装 requests 库，跳过通知')
+        return False
+
+    items = [{
+        'name': str(r.get('name') or '未知账号')[:100],
+        'success': r.get('success') is True,
+        'message': str(r.get('message') or '')[:200],
+    } for r in results]
+    payload = {
+        'source': 'newapi-checkin',
+        'type': 'checkin_summary',
+        'execution_time': execution_time,
+        'total': len(items),
+        'success_count': sum(1 for item in items if item['success']),
+        'fail_count': sum(1 for item in items if not item['success']),
+        'results': items,
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if 200 <= response.status_code < 300:
+            print('[通用通知] 推送成功')
+            return True
+        print(f'[通用通知] 推送失败: HTTP {response.status_code}')
+    except Exception as e:
+        print(f'[通用通知] 推送异常: {e}')
+    return False
+
+
 def send_checkin_notification(results: List[Dict[str, Any]], execution_time: Optional[str] = None) -> bool:
     """
-    发送签到通知到钉钉
+    发送签到通知到钉钉，并可选推送到通用 Webhook
     
     Args:
         results: 签到结果列表
         execution_time: 执行时间（可选，默认使用当前时间）
         
     Returns:
-        是否发送成功
+        钉钉通知是否发送成功
     """
+    if not execution_time:
+        execution_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 通用 Webhook 与钉钉相互独立，任何一方失败都不影响签到主流程
+    _send_generic_webhook(results, execution_time)
+
     # 从环境变量获取配置
     webhook_url = os.environ.get('DINGTALK_WEBHOOK', '')
     secret = os.environ.get('DINGTALK_SECRET', '')
@@ -289,10 +332,6 @@ def send_checkin_notification(results: List[Dict[str, Any]], execution_time: Opt
     if not webhook_url:
         print('[钉钉通知] 未配置 DINGTALK_WEBHOOK，跳过通知')
         return False
-    
-    # 默认执行时间
-    if not execution_time:
-        execution_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
     # 构建报告
     report = build_checkin_report(results, execution_time)
