@@ -271,9 +271,13 @@ def build_checkin_report(results: List[Dict[str, Any]], execution_time: str) -> 
     return '\n'.join(lines)
 
 
-def _send_generic_webhook(results: List[Dict[str, Any]], execution_time: str) -> bool:
+def _is_dingtalk_webhook(url: str) -> bool:
+    return 'oapi.dingtalk.com' in url.lower()
+
+
+def _send_generic_webhook(results: List[Dict[str, Any]], execution_time: str, url: str = '') -> bool:
     """通用 Webhook 推送（可选）。失败只记录原因，绝不影响签到主流程。"""
-    url = (os.environ.get('GENERIC_WEBHOOK_URL') or '').strip()
+    url = (url or os.environ.get('GENERIC_WEBHOOK_URL') or '').strip()
     if not url:
         return False
     if not url.lower().startswith('https://'):
@@ -322,15 +326,21 @@ def send_checkin_notification(results: List[Dict[str, Any]], execution_time: Opt
     if not execution_time:
         execution_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # 通用 Webhook 与钉钉相互独立，任何一方失败都不影响签到主流程
-    _send_generic_webhook(results, execution_time)
+    # 通用 Webhook 与钉钉相互独立，任何一方失败都不影响签到主流程。
+    # 未注入独立 GENERIC_WEBHOOK_URL 时，非钉钉域名的 DINGTALK_WEBHOOK 也按通用格式推送。
+    webhook_url = os.environ.get('DINGTALK_WEBHOOK', '')
+    generic_url = os.environ.get('GENERIC_WEBHOOK_URL', '')
+    if generic_url:
+        _send_generic_webhook(results, execution_time, generic_url)
+    elif webhook_url and not _is_dingtalk_webhook(webhook_url):
+        _send_generic_webhook(results, execution_time, webhook_url)
+        webhook_url = ''
 
     # 从环境变量获取配置
-    webhook_url = os.environ.get('DINGTALK_WEBHOOK', '')
     secret = os.environ.get('DINGTALK_SECRET', '')
     
     if not webhook_url:
-        print('[钉钉通知] 未配置 DINGTALK_WEBHOOK，跳过通知')
+        print('[钉钉通知] 未配置钉钉 Webhook，跳过钉钉通知')
         return False
     
     # 构建报告
